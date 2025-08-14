@@ -1,0 +1,20 @@
+# Install discord.py from master branch (latest fixes)
+discord.py[voice] @ git+https://github.com/Rapptz/discord.py.git@13432591c6a7b095cb8daec687667c69a3469d95
+
+# Install latest PyNaCl to match discord.py master
+PyNaCl
+# Or if still having issues, use master branch:
+# PyNaCl @ git+https://github.com/pyca/pynacl.git
+
+# Keep these at stable versions
+aiohttp>=3.8.0
+
+# Audio processing
+yt-dlp>=2024.1.4
+
+# Spotify integration
+spotipy>=2.22.1
+
+# Additional dependencies
+cffi>=1.15.0
+cryptography>=3.4.8

@@ -1,0 +1,17 @@
+services:
+  bot:
+    build:
+      context: .
+    container_name: discord-bot
+    command: "python app.py"
+
+    env_file: ".env"
+    network_mode: "host"
+    volumes:
+      - ./app:/app
+      - ./downloads:/downloads
+      - ./playlists:/playlists
+    
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
