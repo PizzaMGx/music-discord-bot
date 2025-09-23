@@ -1,4 +1,3 @@
-# bot.py
 import os
 import re
 import json
@@ -76,13 +75,16 @@ class PlaylistManager:
     def __init__(self, playlists_dir: str):
         self.playlists_dir = playlists_dir
     
-    def save_playlist(self, name: str, tracks: List[str], guild_id: int):
-        """Save a playlist with list of file paths."""
+    def save_playlist(self, name: str, tracks: List[Dict], guild_id: int, playlist_url: str = None, source_type: str = "unknown"):
+        """Save a playlist with list of track dictionaries."""
         playlist_data = {
             "name": name,
             "tracks": tracks,
             "guild_id": guild_id,
-            "track_count": len(tracks)
+            "track_count": len(tracks),
+            "playlist_url": playlist_url,
+            "source_type": source_type,  # "spotify", "youtube", "manual"
+            "shuffle": False
         }
         playlist_file = os.path.join(self.playlists_dir, f"{sanitize_filename(name)}.json")
         with open(playlist_file, 'w', encoding='utf-8') as f:
@@ -95,18 +97,58 @@ class PlaylistManager:
             return None
         try:
             with open(playlist_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                playlist_data = json.load(f)
+                
+            # Migrate old format to new format if needed
+            if playlist_data.get("tracks") and isinstance(playlist_data["tracks"][0], str):
+                playlist_data = self._migrate_old_format(playlist_data)
+                # Save the migrated format
+                with open(playlist_file, 'w', encoding='utf-8') as f:
+                    json.dump(playlist_data, f, indent=2, ensure_ascii=False)
+                    
+            return playlist_data
         except (json.JSONDecodeError, IOError):
             return None
     
-    def list_playlists(self) -> List[str]:
-        """List all available playlist names."""
+    def _migrate_old_format(self, old_data: Dict) -> Dict:
+        """Migrate old playlist format to new format."""
+        new_tracks = []
+        for track_path in old_data.get("tracks", []):
+            # Extract name from file path
+            filename = os.path.basename(track_path)
+            name = os.path.splitext(filename)[0]  # Remove extension
+            
+            new_tracks.append({
+                "name": name,
+                "path": track_path,
+                "artist": None,
+                "title": None
+            })
+        
+        return {
+            "name": old_data.get("name", "Unknown"),
+            "tracks": new_tracks,
+            "guild_id": old_data.get("guild_id"),
+            "track_count": len(new_tracks),
+            "playlist_url": None,
+            "source_type": "migrated",
+            "shuffle": old_data.get("shuffle", False)
+        }
+    
+    def list_playlists(self) -> List[Dict]:
+        """List all available playlists with basic info."""
         playlists = []
         for filename in os.listdir(self.playlists_dir):
             if filename.endswith('.json'):
-                name = filename[:-5]  # Remove .json extension
-                playlists.append(name.replace('_', ' '))  # Basic unsanitization
-        return sorted(playlists)
+                playlist_data = self.load_playlist(filename[:-5])  # Remove .json
+                if playlist_data:
+                    playlists.append({
+                        "name": playlist_data.get("name", "Unknown"),
+                        "track_count": playlist_data.get("track_count", 0),
+                        "source_type": playlist_data.get("source_type", "unknown"),
+                        "has_url": bool(playlist_data.get("playlist_url"))
+                    })
+        return sorted(playlists, key=lambda x: x["name"])
     
     def delete_playlist(self, name: str) -> bool:
         """Delete a playlist."""
@@ -406,14 +448,16 @@ async def download(ctx, url: str, *, playlist_name: str = None):
     """Download and save a playlist for later playback."""
     await ctx.reply("⏳ Starting download...")
     
-    downloaded_tracks: List[str] = []
+    downloaded_tracks: List[Dict] = []
     actual_playlist_name: str = playlist_name or "Unknown Playlist"
+    source_type: str = "unknown"
     
     try:
         if is_spotify_playlist(url):
             if SP is None:
                 raise RuntimeError("Spotify credentials missing; cannot process Spotify playlists.")
             
+            source_type = "spotify"
             # Get playlist info and tracks
             actual_playlist_name, tracks = await asyncio.to_thread(get_spotify_playlist_info, url)
             if playlist_name:  # Override with user-provided name
@@ -430,7 +474,12 @@ async def download(ctx, url: str, *, playlist_name: str = None):
             for i, (artist, title) in enumerate(tracks, 1):
                 try:
                     path = await asyncio.to_thread(ensure_download_for_spotify_track, artist, title)
-                    downloaded_tracks.append(path)
+                    downloaded_tracks.append({
+                        "name": f"{artist} - {title}",
+                        "path": path,
+                        "artist": artist,
+                        "title": title
+                    })
                     
                     # Progress update every 5 songs
                     if i % 5 == 0:
@@ -445,6 +494,7 @@ async def download(ctx, url: str, *, playlist_name: str = None):
                 await ctx.send(f"⚠️ Failed to download {failed_downloads} tracks.")
 
         elif is_youtube_url(url):
+            source_type = "youtube"
             actual_playlist_name, entries = await asyncio.to_thread(yt_resolve_playlist_or_video, url)
             if playlist_name:  # Override with user-provided name
                 actual_playlist_name = playlist_name
@@ -458,7 +508,12 @@ async def download(ctx, url: str, *, playlist_name: str = None):
             for i, entry in enumerate(entries, 1):
                 try:
                     path = await asyncio.to_thread(download_if_needed_for_entry, entry)
-                    downloaded_tracks.append(path)
+                    downloaded_tracks.append({
+                        "name": entry.get("title", "Unknown"),
+                        "path": path,
+                        "artist": entry.get("uploader"),
+                        "title": entry.get("title")
+                    })
                     
                     if i % 5 == 0:
                         await ctx.send(f"⏳ Downloaded {i}/{len(entries)} videos...")
@@ -481,10 +536,148 @@ async def download(ctx, url: str, *, playlist_name: str = None):
         await ctx.reply("❌ No tracks were successfully downloaded.")
         return
 
-    # Save the playlist
-    playlist_manager.save_playlist(actual_playlist_name, downloaded_tracks, ctx.guild.id)
+    # Save the playlist with new format
+    playlist_manager.save_playlist(actual_playlist_name, downloaded_tracks, ctx.guild.id, url, source_type)
     
     await ctx.reply(f"✅ Downloaded and saved **{len(downloaded_tracks)}** tracks as playlist **{actual_playlist_name}**!")
+
+@bot.command(usage="/update <playlist_name>", help="Update a playlist from its original URL.")
+async def update(ctx, *, playlist_name: str):
+    """Update an existing playlist from its original URL."""
+    # Load existing playlist
+    playlist_data = playlist_manager.load_playlist(playlist_name)
+    if not playlist_data:
+        await ctx.reply(f"❌ Playlist **{playlist_name}** not found.")
+        return
+
+    playlist_url = playlist_data.get("playlist_url")
+    if not playlist_url:
+        await ctx.reply(f"❌ Playlist **{playlist_name}** doesn't have an original URL to update from.")
+        return
+
+    await ctx.reply(f"🔄 Updating playlist **{playlist_name}** from original source...")
+
+    try:
+        # Get current tracks for comparison
+        old_tracks = {track.get("name", ""): track for track in playlist_data.get("tracks", [])}
+        
+        # Re-download the playlist
+        downloaded_tracks: List[Dict] = []
+        source_type = playlist_data.get("source_type", "unknown")
+        
+        if is_spotify_playlist(playlist_url):
+            if SP is None:
+                raise RuntimeError("Spotify credentials missing; cannot update Spotify playlists.")
+            
+            # Get updated playlist info
+            _, tracks = await asyncio.to_thread(get_spotify_playlist_info, playlist_url)
+            
+            if not tracks:
+                raise RuntimeError("Updated playlist has no tracks or could not be read.")
+            
+            await ctx.send(f"📥 Checking **{len(tracks)}** tracks for updates...")
+            
+            new_downloads = 0
+            failed_downloads = 0
+            
+            for i, (artist, title) in enumerate(tracks, 1):
+                track_name = f"{artist} - {title}"
+                
+                try:
+                    # Check if track already exists
+                    if track_name in old_tracks and os.path.exists(old_tracks[track_name].get("path", "")):
+                        # Reuse existing file
+                        downloaded_tracks.append(old_tracks[track_name])
+                    else:
+                        # Download new track
+                        path = await asyncio.to_thread(ensure_download_for_spotify_track, artist, title)
+                        downloaded_tracks.append({
+                            "name": track_name,
+                            "path": path,
+                            "artist": artist,
+                            "title": title
+                        })
+                        new_downloads += 1
+                    
+                    # Progress update every 10 songs
+                    if i % 10 == 0:
+                        await ctx.send(f"⏳ Processed {i}/{len(tracks)} tracks...")
+                        
+                except Exception as e:
+                    failed_downloads += 1
+                    print(f"Failed to update {artist} - {title}: {e}")
+                    continue
+            
+            # Report results
+            removed_count = len(old_tracks) - (len(downloaded_tracks) - new_downloads)
+            result_msg = f"✅ Updated **{playlist_name}**!\n"
+            result_msg += f"📊 **{new_downloads}** new tracks downloaded\n"
+            if removed_count > 0:
+                result_msg += f"🗑️ **{removed_count}** tracks removed from playlist\n"
+            if failed_downloads > 0:
+                result_msg += f"⚠️ **{failed_downloads}** tracks failed to update"
+
+        elif is_youtube_url(playlist_url):
+            # Similar logic for YouTube playlists
+            _, entries = await asyncio.to_thread(yt_resolve_playlist_or_video, playlist_url)
+            
+            if not entries:
+                raise RuntimeError("Updated playlist has no videos or could not be read.")
+            
+            await ctx.send(f"📥 Checking **{len(entries)}** videos for updates...")
+            
+            new_downloads = 0
+            failed_downloads = 0
+            
+            for i, entry in enumerate(entries, 1):
+                track_name = entry.get("title", "Unknown")
+                
+                try:
+                    # Check if track already exists
+                    if track_name in old_tracks and os.path.exists(old_tracks[track_name].get("path", "")):
+                        downloaded_tracks.append(old_tracks[track_name])
+                    else:
+                        # Download new track
+                        path = await asyncio.to_thread(download_if_needed_for_entry, entry)
+                        downloaded_tracks.append({
+                            "name": track_name,
+                            "path": path,
+                            "artist": entry.get("uploader"),
+                            "title": entry.get("title")
+                        })
+                        new_downloads += 1
+                    
+                    if i % 10 == 0:
+                        await ctx.send(f"⏳ Processed {i}/{len(entries)} videos...")
+                        
+                except Exception as e:
+                    failed_downloads += 1
+                    print(f"Failed to update {entry.get('title', 'Unknown')}: {e}")
+                    continue
+            
+            removed_count = len(old_tracks) - (len(downloaded_tracks) - new_downloads)
+            result_msg = f"✅ Updated **{playlist_name}**!\n"
+            result_msg += f"📊 **{new_downloads}** new videos downloaded\n"
+            if removed_count > 0:
+                result_msg += f"🗑️ **{removed_count}** videos removed from playlist\n"
+            if failed_downloads > 0:
+                result_msg += f"⚠️ **{failed_downloads}** videos failed to update"
+        else:
+            raise RuntimeError("Unsupported playlist URL type for updating.")
+
+        # Save updated playlist
+        playlist_manager.save_playlist(
+            playlist_data["name"], 
+            downloaded_tracks, 
+            ctx.guild.id, 
+            playlist_url, 
+            source_type
+        )
+        
+        await ctx.reply(result_msg)
+
+    except Exception as e:
+        await ctx.reply(f"❌ Error updating playlist: {e}")
 
 @bot.command(usage="/play <playlist_name>", help="Play a downloaded playlist.")
 async def play(ctx, *, playlist_name: str):
@@ -500,11 +693,17 @@ async def play(ctx, *, playlist_name: str):
         await ctx.reply(f"❌ Playlist **{playlist_name}** is empty.")
         return
 
-    # Verify files still exist
+    # Verify files still exist and extract paths
     existing_tracks = []
     for track in tracks:
-        if os.path.exists(track):
-            existing_tracks.append(track)
+        if isinstance(track, dict):
+            track_path = track.get("path", "")
+        else:
+            # Handle old format (direct string paths)
+            track_path = track
+            
+        if os.path.exists(track_path):
+            existing_tracks.append(track_path)
 
     if not existing_tracks:
         await ctx.reply(f"❌ No files found for playlist **{playlist_name}**. Files may have been deleted.")
@@ -545,8 +744,17 @@ async def playlists(ctx):
         await ctx.reply("No playlists found. Use `/download <url>` to download a playlist first.")
         return
     
-    playlist_list = "\n".join(f"• {playlist}" for playlist in available_playlists)
-    await ctx.reply(f"📋 **Available Playlists:**\n```\n{playlist_list}\n```")
+    playlist_info = []
+    for playlist in available_playlists:
+        source_icon = "🎵" if playlist["source_type"] == "spotify" else "📺" if playlist["source_type"] == "youtube" else "📁"
+        update_status = "🔄" if playlist["has_url"] else "❌"
+        playlist_info.append(f"{source_icon} **{playlist['name']}** ({playlist['track_count']} tracks) {update_status}")
+    
+    embed = discord.Embed(title="📋 Available Playlists", color=0x1DB954)
+    embed.description = "\n".join(playlist_info)
+    embed.add_field(name="Legend", value="🎵 Spotify | 📺 YouTube | 📁 Other\n🔄 Can update | ❌ No update URL", inline=False)
+    
+    await ctx.reply(embed=embed)
 
 @bot.command(usage="/remove <playlist_name>", help="Delete a downloaded playlist.")
 async def remove(ctx, *, playlist_name: str):
@@ -555,6 +763,58 @@ async def remove(ctx, *, playlist_name: str):
         await ctx.reply(f"🗑️ Removed playlist **{playlist_name}**.")
     else:
         await ctx.reply(f"❌ Playlist **{playlist_name}** not found.")
+
+@bot.command(usage="/info <playlist_name>", help="Show detailed information about a playlist.")
+async def info(ctx, *, playlist_name: str):
+    """Show detailed information about a playlist."""
+    playlist_data = playlist_manager.load_playlist(playlist_name)
+    if not playlist_data:
+        await ctx.reply(f"❌ Playlist **{playlist_name}** not found.")
+        return
+    
+    # Count existing vs missing files
+    tracks = playlist_data.get("tracks", [])
+    existing_count = 0
+    missing_files = []
+    
+    for track in tracks:
+        if isinstance(track, dict):
+            track_path = track.get("path", "")
+            track_name = track.get("name", "Unknown")
+        else:
+            track_path = track
+            track_name = os.path.basename(track_path)
+        
+        if os.path.exists(track_path):
+            existing_count += 1
+        else:
+            missing_files.append(track_name)
+    
+    embed = discord.Embed(title=f"📋 {playlist_data.get('name', 'Unknown')}", color=0x1DB954)
+    
+    # Basic info
+    embed.add_field(name="Total Tracks", value=playlist_data.get('track_count', 0), inline=True)
+    embed.add_field(name="Available", value=existing_count, inline=True)
+    embed.add_field(name="Missing", value=len(missing_files), inline=True)
+    
+    source_type = playlist_data.get('source_type', 'unknown')
+    source_icon = "🎵" if source_type == "spotify" else "📺" if source_type == "youtube" else "📁"
+    embed.add_field(name="Source", value=f"{source_icon} {source_type.title()}", inline=True)
+    
+    can_update = bool(playlist_data.get('playlist_url'))
+    embed.add_field(name="Can Update", value="✅ Yes" if can_update else "❌ No", inline=True)
+    embed.add_field(name="Guild ID", value=playlist_data.get('guild_id', 'Unknown'), inline=True)
+    
+    # Show some missing files if any
+    if missing_files and len(missing_files) <= 5:
+        embed.add_field(name="Missing Files", value="\n".join(f"• {name}" for name in missing_files), inline=False)
+    elif missing_files:
+        embed.add_field(name="Missing Files", value=f"• {missing_files[0]}\n• {missing_files[1]}\n• {missing_files[2]}\n... and {len(missing_files) - 3} more", inline=False)
+    
+    if playlist_data.get('playlist_url'):
+        embed.add_field(name="Original URL", value=f"[Click here]({playlist_data['playlist_url']})", inline=False)
+    
+    await ctx.reply(embed=embed)
 
 @bot.command(help="Skip the current song.")
 async def skip(ctx):
