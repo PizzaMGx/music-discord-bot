@@ -9,6 +9,11 @@ FFMPEG_OPTIONS = {
     "options": "-vn -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
 }
 
+VOICE_DAVE_ERROR = (
+    "Discord rejected the voice connection because this channel requires DAVE/E2EE support "
+    "(voice close code 4017). Rebuild the container so it installs discord.py 2.7+ and davey."
+)
+
 
 class GuildMusic:
     def __init__(self, guild: discord.Guild):
@@ -182,6 +187,13 @@ async def ensure_voice(interaction) -> discord.VoiceClient:
                     
         except asyncio.TimeoutError:
             print(f"[voice] Timeout on attempt {attempt + 1}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+                continue
+        except discord.ConnectionClosed as e:
+            if getattr(e, "code", None) == 4017:
+                raise commands.CommandError(VOICE_DAVE_ERROR) from e
+            print(f"[voice] Connection closed on attempt {attempt + 1}: {e}")
             if attempt < 2:
                 await asyncio.sleep(2)
                 continue

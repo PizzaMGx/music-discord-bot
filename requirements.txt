@@ -1,10 +1,8 @@
-# Install discord.py from master branch (latest fixes)
-discord.py[voice] @ git+https://github.com/Rapptz/discord.py.git@13432591c6a7b095cb8daec687667c69a3469d95
-
-# Install latest PyNaCl to match discord.py master
-PyNaCl
-# Or if still having issues, use master branch:
-# PyNaCl @ git+https://github.com/pyca/pynacl.git
+# discord.py 2.7+ adds DAVE support, which Discord now requires for
+# non-stage voice channels. Without it, voice connects fail with close code 4017.
+discord.py[voice]>=2.7.1,<2.8
+davey>=0.1.5,<0.2
+PyNaCl>=1.5,<1.6
 
 # Keep these at stable versions
 aiohttp>=3.8.0
