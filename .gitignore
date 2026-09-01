@@ -1,4 +1,9 @@
-downloads/*
-playlists/*
 .env
-./app/.cache
+.venv/
+__pycache__/
+*.py[cod]
+app/.cache/
+
+# Runtime media and metadata can be large and may contain private library data.
+downloads/
+playlists/

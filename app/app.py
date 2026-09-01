@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from player import enqueue_tracks, ensure_voice, get_music_state, rebuild_queue_from_index
+from player import enqueue_next, enqueue_tracks, ensure_voice, get_music_state, rebuild_queue_from_index
 from sources import (
     YDL_OPTS_DOWNLOAD_SINGLE,
     download_if_needed_for_entry,
@@ -21,7 +21,7 @@ from sources import (
     yt_get_single_entry,
     yt_resolve_playlist_or_video,
 )
-from storage import PlaylistManager, find_song_by_id, load_songs, upsert_song
+from storage import PlaylistManager, find_song, load_songs, search_songs, upsert_song
 from utils import normalize_track_entry, sanitize_filename, send_lines_interaction
 
 # ========= Configuration =========
@@ -63,6 +63,7 @@ def ensure_track_order(st) -> None:
 async def on_ready():
     if config.GUILD_ID:
         guild = discord.Object(id=int(config.GUILD_ID))
+        bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
     else:
         await bot.tree.sync()
@@ -326,7 +327,7 @@ async def update_slash(interaction: discord.Interaction, playlist_name: str):
         app_commands.Choice(name="song", value="song"),
     ]
 )
-@app_commands.describe(value="Playlist name or song ID")
+@app_commands.describe(value="Playlist name, song title, or song ID")
 async def play_slash(interaction: discord.Interaction, mode: app_commands.Choice[str], value: str):
     st = get_music_state(interaction.guild)
     if mode.value == "playlist":
@@ -371,9 +372,9 @@ async def play_slash(interaction: discord.Interaction, mode: app_commands.Choice
             await respond(interaction, f"Playing **{playlist_name}** ({len(existing_tracks)} tracks)")
         return
 
-    song = find_song_by_id(value.strip())
+    song = find_song(value)
     if not song:
-        await respond(interaction, f"Song ID **{value}** not found.")
+        await respond(interaction, f"Could not find one saved song matching **{value}**. Use `/search {value}` or select an autocomplete result.")
         return
 
     entry = normalize_track_entry(song)
@@ -387,6 +388,7 @@ async def play_slash(interaction: discord.Interaction, mode: app_commands.Choice
         await respond(interaction, str(e))
         return
 
+    was_busy = st.now_playing is not None or st.queue.qsize() > 0
     await enqueue_tracks(st, [entry])
     try:
         await st.start(vc)
@@ -394,7 +396,61 @@ async def play_slash(interaction: discord.Interaction, mode: app_commands.Choice
         await respond(interaction, f"Failed to start playback: {e}")
         return
 
-    await respond(interaction, f"Playing song **{entry['name']}**")
+    if was_busy:
+        await respond(interaction, f"Added **{entry['name']}** to the queue.")
+    else:
+        await respond(interaction, f"Playing song **{entry['name']}**.")
+
+
+async def saved_item_autocomplete(interaction: discord.Interaction, current: str):
+    mode = getattr(interaction.namespace, "mode", "song")
+    mode = getattr(mode, "value", mode)
+    if mode == "playlist":
+        needle = current.casefold()
+        items = [
+            item for item in playlist_manager.list_playlists()
+            if needle in item.get("name", "").casefold()
+        ][:25]
+        return [app_commands.Choice(name=item["name"][:100], value=item["name"][:100]) for item in items]
+
+    return [
+        app_commands.Choice(
+            name=str(song.get("name") or "Unknown")[:100],
+            value=str(song.get("id") or song.get("name") or "")[:100],
+        )
+        for song in search_songs(current, limit=25)
+    ]
+
+
+play_slash.autocomplete("value")(saved_item_autocomplete)
+
+
+@bot.tree.command(name="queue-add", description="Add one saved song directly after the current track.")
+@app_commands.describe(song="Saved song title or ID")
+async def queue_add_slash(interaction: discord.Interaction, song: str):
+    saved_song = find_song(song)
+    if not saved_song:
+        await respond(interaction, f"Could not find one saved song matching **{song}**. Use `/search {song}` or select an autocomplete result.")
+        return
+
+    entry = normalize_track_entry(saved_song)
+    if not os.path.exists(entry.get("path", "")):
+        await respond(interaction, "Song file is missing. Download it again with `/downloadsong`.")
+        return
+
+    try:
+        vc = await ensure_voice(interaction)
+    except commands.CommandError as e:
+        await respond(interaction, str(e))
+        return
+
+    st = get_music_state(interaction.guild)
+    position = await enqueue_next(st, entry)
+    await st.start(vc)
+    await respond(interaction, f"Added **{entry['name']}** as queue #{position + 1}; it will play next.")
+
+
+queue_add_slash.autocomplete("song")(saved_item_autocomplete)
 
 
 @bot.tree.command(name="playlists", description="List all saved playlists.")
@@ -608,6 +664,33 @@ async def queue_slash(interaction: discord.Interaction, action: Optional[app_com
     await send_lines_interaction(interaction, lines)
 
 
+@bot.tree.command(name="queue-all", description="Show every song in the queue with its playback status.")
+async def queue_all_slash(interaction: discord.Interaction):
+    st = get_music_state(interaction.guild)
+    ensure_track_order(st)
+    if not st.track_order:
+        await respond(interaction, "Queue is empty.")
+        return
+
+    lines = []
+    for index, entry in enumerate(st.track_order):
+        if st.now_playing is not None and index == st.now_playing_index:
+            status = "NOW"
+        elif index < st.next_index:
+            status = "PLAYED"
+        elif index == st.next_index:
+            status = "NEXT"
+        else:
+            status = "UPCOMING"
+        lines.append(f"{index + 1}. [{status}] {entry.get('name', 'Unknown')}")
+
+    await send_lines_interaction(
+        interaction,
+        lines,
+        header=f"Full queue ({len(st.track_order)} songs):",
+    )
+
+
 @bot.tree.command(name="queue-now", description="Show the currently playing track.")
 async def queue_now_slash(interaction: discord.Interaction):
     st = get_music_state(interaction.guild)
@@ -714,8 +797,7 @@ async def search_slash(interaction: discord.Interaction, query: str):
     if not songs:
         await respond(interaction, "No saved songs. Use /downloadsong first.")
         return
-    query_lower = query.strip().lower()
-    matches = [s for s in songs if query_lower in s.get("name", "").lower()]
+    matches = search_songs(query)
     if not matches:
         await respond(interaction, "No matches found.")
         return
@@ -725,7 +807,8 @@ async def search_slash(interaction: discord.Interaction, query: str):
         name = song.get("name", "Unknown")
         url = song.get("url", "Unknown")
         song_id = song.get("id", "Unknown")
-        lines.append(f"{name} | {url} | {song_id}")
+        uploader = song.get("uploader") or "Unknown uploader"
+        lines.append(f"**{name}** — {uploader} | ID: `{song_id}` | {url}")
     if len(matches) > 20:
         lines.append(f"... and {len(matches) - 20} more")
 
@@ -733,7 +816,11 @@ async def search_slash(interaction: discord.Interaction, query: str):
 
 @bot.tree.command(name="join", description="Join your current voice channel.")
 async def join(interaction: discord.Interaction):
-    vc = await ensure_voice(interaction)
+    try:
+        vc = await ensure_voice(interaction)
+    except commands.CommandError as e:
+        await respond(interaction, str(e))
+        return
     await respond(interaction, f"Joined **{vc.channel.name}**.")
 
 @bot.tree.command(name="leave", description="Leave the voice channel and clear the queue.")
@@ -1120,7 +1207,7 @@ async def play(ctx, mode: str, *, value: str):
             await ctx.reply(f"Г-Л,? Playing **{playlist_name}** ({len(existing_tracks)} tracks)")
         return
 
-    song = find_song_by_id(value.strip())
+    song = find_song(value)
     if not song:
         await ctx.reply(f"Г?O Song ID **{value}** not found. Use `/search <name>` to find songs.")
         return

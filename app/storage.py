@@ -74,7 +74,8 @@ class PlaylistManager:
         """List all available playlists with basic info."""
         playlists = []
         for filename in os.listdir(self.playlists_dir):
-            if filename.endswith('.json'):
+            # songs.json is the individual-song library, not a playlist.
+            if filename.endswith('.json') and filename != os.path.basename(SONGS_FILE):
                 playlist_data = self.load_playlist(filename[:-5])  # Remove .json
                 if playlist_data:
                     playlists.append({
@@ -135,3 +136,43 @@ def find_song_by_id(song_id: str) -> Optional[Dict]:
         if song.get("id") == song_id:
             return song
     return None
+
+
+def search_songs(query: str, limit: Optional[int] = None) -> List[Dict]:
+    """Search saved songs by ID, title, or uploader, with exact matches first."""
+    needle = (query or "").strip().casefold()
+    songs = load_songs()
+    if not needle:
+        matches = songs
+    else:
+        def searchable_text(song: Dict) -> str:
+            return " ".join(
+                str(song.get(field) or "") for field in ("id", "name", "uploader")
+            ).casefold()
+
+        matches = [song for song in songs if needle in searchable_text(song)]
+        matches.sort(
+            key=lambda song: (
+                0 if str(song.get("id") or "").casefold() == needle else
+                1 if str(song.get("name") or "").casefold() == needle else
+                2,
+                str(song.get("name") or "").casefold(),
+            )
+        )
+    return matches[:limit] if limit is not None else matches
+
+
+def find_song(query: str) -> Optional[Dict]:
+    """Resolve an ID, exact title, or a unique partial saved-song match."""
+    needle = (query or "").strip().casefold()
+    if not needle:
+        return None
+
+    matches = search_songs(query)
+    for song in matches:
+        if str(song.get("id") or "").casefold() == needle:
+            return song
+    for song in matches:
+        if str(song.get("name") or "").casefold() == needle:
+            return song
+    return matches[0] if len(matches) == 1 else None

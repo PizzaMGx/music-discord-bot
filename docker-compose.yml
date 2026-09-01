@@ -6,6 +6,9 @@ services:
     command: "python app.py"
 
     env_file: ".env"
+    environment:
+      # Keep new slash commands scoped to this server so they appear immediately.
+      DISCORD_GUILD_ID: "752901417865445381"
     network_mode: "host"
     volumes:
       - ./app:/app

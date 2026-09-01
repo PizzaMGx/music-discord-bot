@@ -227,6 +227,18 @@ async def enqueue_tracks(st: GuildMusic, entries: List[Dict], reset: bool = Fals
         await st.queue.put(entry)
 
 
+async def enqueue_next(st: GuildMusic, entry: Dict) -> int:
+    """Insert a track immediately after the current track (LIFO for repeated adds)."""
+    if not st.track_order or st.now_playing_index is None:
+        await enqueue_tracks(st, [entry])
+        return st.next_index
+
+    insert_at = min(max(st.next_index, st.now_playing_index + 1), len(st.track_order))
+    st.track_order.insert(insert_at, entry)
+    await rebuild_queue_from_index(st, st.next_index)
+    return insert_at
+
+
 async def rebuild_queue_from_index(st: GuildMusic, start_index: int) -> None:
     st.clear_pending_queue()
     for entry in st.track_order[start_index:]:
